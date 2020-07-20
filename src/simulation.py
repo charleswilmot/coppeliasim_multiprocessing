@@ -8,7 +8,6 @@ import numpy as np
 from contextlib import contextmanager
 from traceback import format_exc
 import time
-# import atexit
 
 
 MODEL_PATH = os.environ["COPPELIASIM_MODEL_PATH"]
@@ -30,6 +29,8 @@ def communicate_return_value(method):
 
 
 def default_dont_communicate_return(cls):
+    """Class decorator for the SimulationConsumers meaning that by default, all
+    methods don't communicate their return value to the Producer class"""
     for attribute_name, attribute in cls.__dict__.items():
         if callable(attribute):
             communicate = hasattr(attribute, '_communicate_return_value')
@@ -38,20 +39,22 @@ def default_dont_communicate_return(cls):
 
 
 def c2p_convertion_function(cls, method):
-    def new_method(self, *args, **kwargs):
+    """Function that transform a Consumer method into a Producer method.
+    It add a blocking flag that determines whether the call is blocking or not.
+    If you call a `Producer.mothod(blocking=False)`, you then must
+    `Producer._wait_for_answer()`"""
+    def new_method(self, *args, blocking=True, **kwargs):
         cls._send_command(self, method, *args, **kwargs)
-        if method._communicate_return_value:
-            # print(method, "waiting for an answer...")
-            while not self._process_io["return_value_pipe_out"].poll(1):
-                # print(method, "waiting for an answer...nothing yet...alive?")
-                self._check_consumer_alive()
-            answer = self._process_io["return_value_pipe_out"].recv()
-            # print(method, "waiting for an answer...got it!")
-            return answer
+        if method._communicate_return_value and blocking:
+            return cls._wait_for_answer(self)
+    new_method._communicate_return_value = method._communicate_return_value
     return new_method
 
 
 def consumer_to_producer_method_conversion(cls):
+    """Class decorator that transforms all methods from the Consumer to the
+    Producer, except for methods starting with an '_', and for the
+    multiprocessing.Process methods"""
     proc_methods = [
         "run", "is_alive", "join", "kill", "start", "terminate", "close"
     ]
@@ -73,28 +76,33 @@ def consumer_to_producer_method_conversion(cls):
 
 
 def p2p_convertion_function(name):
+    """This function transforms a producer method into a Pool method"""
     def new_method(self, *args, **kwargs):
         if self._distribute_args_mode:
             # all args are iterables that must be distributed to each producer
-            return [
+            for i, producer in enumerate(self._active_producers):
                 getattr(producer, name)(
                     *[arg[i] for arg in args],
+                    blocking=False,
                     **{key: value[i] for key, value in kwargs.items()}
                 )
-                for i, producer in enumerate(self._active_producers)
-            ]
         else:
+            for producer in self._active_producers:
+                getattr(producer, name)(*args, blocking=False, **kwargs)
+        if getattr(SimulationProducer, name)._communicate_return_value:
             return [
-                getattr(producer, name)(*args, **kwargs)
-                for producer in self._active_producers
+                producer._wait_for_answer() for producer in self._active_producers
             ]
     return new_method
 
 def producer_to_pool_method_convertion(cls):
+    """This class decorator transforms all Producer methods (besides close and
+    methods starting with '_') to the Pool object."""
     convertables = {
         method_name: method \
         for method_name, method in SimulationProducer.__dict__.items()\
-        if callable(method) and not method_name.startswith("_")
+        if callable(method) and not method_name.startswith("_")\
+        and not method_name == 'close'
     }
     for method_name, method in convertables.items():
         new_method = p2p_convertion_function(method_name)
@@ -116,6 +124,7 @@ class SimulationConsumerAbstract(mp.Process):
         self._scene = scene
         self._gui = gui
         self._process_io = process_io
+        np.random.seed()
 
     def run(self):
         self._pyrep = PyRep()
@@ -453,7 +462,6 @@ class SimulationProducer(object):
         self._consumer = SimulationConsumer(self._process_io, scene, gui=gui)
         self._consumer.start()
         print("consumer {} started".format(self._consumer._id))
-        self._process_io["simulaton_ready"].wait()
         self._closed = False
         # atexit.register(self.close)
 
@@ -476,11 +484,22 @@ class SimulationProducer(object):
         while not semaphore.acquire(block=False, timeout=0.1):
             self._check_consumer_alive()
 
+    def _wait_for_answer(self):
+        while not self._process_io["return_value_pipe_out"].poll(1):
+            # print(method, "waiting for an answer...nothing yet...alive?")
+            self._check_consumer_alive()
+        answer = self._process_io["return_value_pipe_out"].recv()
+        # print(method, "waiting for an answer...got it!")
+        return answer
+
+    def _wait_consumer_ready(self):
+        self._process_io["simulaton_ready"].wait()
+
     def close(self):
         if not self._closed:
             # print("Producer closing")
             if self._consumer.is_alive():
-                self.wait_command_pipe_empty()
+                self._wait_command_pipe_empty()
                 # print("command pipe empty, setting must_quit flag")
                 self._process_io["must_quit"].set()
                 # print("flushing command pipe")
@@ -492,7 +511,7 @@ class SimulationProducer(object):
         else:
             print("{} already closed, doing nothing".format(self._consumer._id))
 
-    def wait_command_pipe_empty(self):
+    def _wait_command_pipe_empty(self):
         self._send_command(SimulationConsumer.signal_command_pipe_empty)
         self._process_io["command_pipe_empty"].wait()
 
@@ -508,6 +527,7 @@ class SimulationPool:
         ]
         self._active_producers_indices = list(range(size))
         self._distribute_args_mode = False
+        self.wait_consumer_ready()
 
     @contextmanager
     def specific(self, list_or_int):
@@ -526,3 +546,11 @@ class SimulationPool:
     def _get_active_producers(self):
         return [self._producers[i] for i in self._active_producers_indices]
     _active_producers = property(_get_active_producers)
+
+    def close(self):
+        for producer in self._producers:
+            producer.close()
+
+    def wait_consumer_ready(self):
+        for producer in self._producers:
+            producer._wait_consumer_ready()
